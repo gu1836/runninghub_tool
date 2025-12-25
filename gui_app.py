@@ -5,6 +5,7 @@ import threading
 import time
 import os
 import re
+import uuid
 from datetime import datetime
 import core_logic
 
@@ -240,11 +241,23 @@ class VoiceTableEditor:
             t.update_voice_list()
             
         self.win.destroy()
+
+
 # --- 3. 任务卡片 ---
 class TaskCard:
     def __init__(self, parent, app, data=None):
         self.app = app
-        self.data = data if data else {}
+        self.data = data if isinstance(data, dict) else {}
+        self.task_id = self.data.get("task_id", str(uuid.uuid4()))
+
+        # --- 【新增】方案 B 状态变量 ---
+        self.pending_timer = None
+        # 记录上一次稳定在栈里的内容快照
+        self.last_stable_prompt = self.data.get("prompt", "")
+        self.last_stable_script = self.data.get("script", "")
+        
+        # 将自己注册到主程序的映射表中
+        self.app.task_mapping[self.task_id] = self
         self.frame = ttk.LabelFrame(parent, text=" 镜头卡片 ", padding=10)
         self.frame.pack(fill=tk.X, padx=15, pady=8)
         self.file_path = self.data.get("img_path", "")
@@ -284,48 +297,78 @@ class TaskCard:
         
         # --- 提示词输入区 ---
         ttk.Label(mid, text="提示词输入:", font=("微软雅黑", 9, "bold")).pack(anchor=tk.W)
-        self.txt_p = tk.Text(mid, height=3, font=("微软雅黑", 9), undo=True, autoseparators=True)
+        # 【修改】undo=False
+        self.txt_p = tk.Text(mid, height=3, font=("微软雅黑", 9), undo=False)
         self.txt_p.pack(fill=tk.X, pady=(0, 5))
-        self.txt_p.insert("1.0", self.data.get("prompt", ""))
-        self.txt_p.bind("<FocusOut>", lambda e: self.app.auto_save_all())
+        self.txt_p.insert("1.0", self.last_stable_prompt)
+        self.txt_p.parent_card = self  # 【新增】反向引用
 
         # --- 台词内容区 ---
         ttk.Label(mid, text="台词内容:", font=("微软雅黑", 9, "bold")).pack(anchor=tk.W)
-        self.txt_s = tk.Text(mid, height=1, font=("微软雅黑", 9, "bold"), undo=True, autoseparators=True)
+        # 【修改】undo=False
+        self.txt_s = tk.Text(mid, height=1, font=("微软雅黑", 9, "bold"), undo=False)
         self.txt_s.pack(fill=tk.X, pady=(0, 5))
-        self.txt_s.insert("1.0", self.data.get("script", ""))
-        self.txt_s.bind("<FocusOut>", lambda e: self.app.auto_save_all())
+        self.txt_s.insert("1.0", self.last_stable_script)
+        self.txt_s.parent_card = self  # 【新增】反向引用
+
+        # --- 【关键绑定】 ---
+        # 监听实质性内容变化（支持中文上屏、粘贴、删除）
+        self.txt_p.bind("<<Modified>>", self._on_text_modified)
+        self.txt_s.bind("<<Modified>>", self._on_text_modified)
+
+        # 失去焦点时立即结算（防止未满1秒就切换卡片导致记录丢失）
+        self.txt_p.bind("<FocusOut>", lambda e: self.force_settle())
+        self.txt_s.bind("<FocusOut>", lambda e: self.force_settle())
 
         # --- 控制行 ---
         ctrl = tk.Frame(mid) 
         ctrl.pack(fill=tk.X)
         
         # 1. 动态指令选择
+        #ttk.Label(ctrl, text="动态:").pack(side=tk.LEFT)
+        #self.cb_motion = ttk.Combobox(ctrl, state="readonly", width=10)
+        #self.cb_motion.pack(side=tk.LEFT, padx=2)
+        
+        # 【新增】搜索匹配按钮：点击打开可视化搜索手册
+        #self.btn_motion_search = ttk.Button(
+        #    ctrl, 
+        #    text="🔍", 
+        #    width=3, 
+            # 错误写法：lambda: MotionSearcher(self.app.root, self.set_motion_by_name)
+            # 正确写法：必须传入 self.app 实例
+        #    command=lambda: MotionSearcher(self.app.root, self.app, self.set_motion_by_name)
+        #)
+        #self.btn_motion_search.pack(side=tk.LEFT, padx=(0, 5))
+
+        #self.update_motion_list() # 初始化列表加载存档
+        #self.cb_motion.bind("<<ComboboxSelected>>", lambda e: self.app.auto_save_all())
+        
+        # 2. 角色选择
+        #ttk.Label(ctrl, text="角色:").pack(side=tk.LEFT)
+        #self.cb = ttk.Combobox(ctrl, state="readonly", width=8)
+        #self.update_voice_list()
+        #self.cb.pack(side=tk.LEFT, padx=2)
+        #if self.data.get("char"): self.cb.set(self.data["char"])
+        #self.cb.bind("<<ComboboxSelected>>", lambda e: self.app.auto_save_all())
+        # --- 1. 动态指令选择 ---
         ttk.Label(ctrl, text="动态:").pack(side=tk.LEFT)
         self.cb_motion = ttk.Combobox(ctrl, state="readonly", width=10)
         self.cb_motion.pack(side=tk.LEFT, padx=2)
         
-        # 【新增】搜索匹配按钮：点击打开可视化搜索手册
-        self.btn_motion_search = ttk.Button(
-            ctrl, 
-            text="🔍", 
-            width=3, 
-            # 错误写法：lambda: MotionSearcher(self.app.root, self.set_motion_by_name)
-            # 正确写法：必须传入 self.app 实例
-            command=lambda: MotionSearcher(self.app.root, self.app, self.set_motion_by_name)
-        )
-        self.btn_motion_search.pack(side=tk.LEFT, padx=(0, 5))
+        # 【关键】初始化列表并设置初始值
+        self.update_motion_list() 
+        # (update_motion_list 内部已经做了 self.cb_motion.set)
 
-        self.update_motion_list() # 初始化列表加载存档
-        self.cb_motion.bind("<<ComboboxSelected>>", lambda e: self.app.auto_save_all())
-        
-        # 2. 角色选择
+        # --- 2. 角色选择 ---
         ttk.Label(ctrl, text="角色:").pack(side=tk.LEFT)
         self.cb = ttk.Combobox(ctrl, state="readonly", width=8)
         self.update_voice_list()
         self.cb.pack(side=tk.LEFT, padx=2)
-        if self.data.get("char"): self.cb.set(self.data["char"])
-        self.cb.bind("<<ComboboxSelected>>", lambda e: self.app.auto_save_all())
+        
+        # 【关键】恢复角色初始值
+        saved_char = self.data.get("char")
+        if saved_char: self.cb.set(saved_char)
+
 
 # --- 3. 比例选择 (修改后的逻辑) ---
         ttk.Label(ctrl, text="比例:").pack(side=tk.LEFT)
@@ -360,6 +403,13 @@ class TaskCard:
         self.cb_dur.pack(side=tk.LEFT, padx=2)
         self.cb_dur.bind("<<ComboboxSelected>>", lambda e: self.app.auto_save_all())
         
+        #事件绑定
+        self.cb.bind("<<ComboboxSelected>>", self._on_ui_change)
+        self.cb_motion.bind("<<ComboboxSelected>>", self._on_ui_change)
+        self.cb_ratio.bind("<<ComboboxSelected>>", self._on_ui_change)
+        self.cb_dur.bind("<<ComboboxSelected>>", self._on_ui_change)
+
+
         # 5. 运行按钮与状态显示
         self.btn = ttk.Button(ctrl, text="▶ 运行", command=self.start)
         self.btn.pack(side=tk.LEFT, padx=5)
@@ -370,6 +420,82 @@ class TaskCard:
         self.lbl_tm = ttk.Label(ctrl, text="00:00")
         self.lbl_tm.pack(side=tk.RIGHT)
 
+    def _on_ui_change(self, event=None):
+        """当 Combobox 等组件改变时触发的统一保存逻辑"""
+        # 如果有预览需求，在这里调用
+        if event and event.widget == self.cb_motion:
+            self.update_motion_preview(self.cb_motion.get())
+        
+        # 触发全局物理存盘
+        self.app.auto_save_all()
+
+    def _on_text_modified(self, event):
+        """当文字改变时触发（由虚拟信号驱动）"""
+        widget = event.widget
+        # 只有当确实发生了实质性修改时才处理
+        if widget.edit_modified():
+            if self.pending_timer:
+                self.app.root.after_cancel(self.pending_timer)
+            
+            # 1000ms 停顿后执行记录
+            self.pending_timer = self.app.root.after(1000, self.force_settle)
+            
+            # 重置标志位以接收下一次信号
+            widget.edit_modified(False)
+
+    def force_settle(self):
+        """立即结算当前的编辑动作"""
+        if self.pending_timer:
+            self.app.root.after_cancel(self.pending_timer)
+            self.pending_timer = None
+        
+        # 检查两个文本框是否需要推入栈
+        self._check_and_push("txt_p", self.last_stable_prompt)
+        self._check_and_push("txt_s", self.last_stable_script)
+
+    def _check_and_push(self, attr_name, old_val):
+        """对比并入栈的内部逻辑"""
+        widget = getattr(self, attr_name)
+        current_text = widget.get("1.0", "end-1c")
+        
+        if current_text != old_val:
+            field_alias = "prompt" if attr_name == "txt_p" else "script"
+            
+            # 记录到全局经理
+            self.app.action_manager.push_action("EDIT_TEXT", {
+                "task_id": self.task_id,
+                "field": attr_name,
+                "old_val": old_val,
+                "new_val": current_text
+            })
+            
+            # 更新该字段对应的稳定快照
+            if attr_name == "txt_p": self.last_stable_prompt = current_text
+            else: self.last_stable_script = current_text
+            
+            # 触发物理存档
+            self.app.auto_save_all()
+
+    def set_text_silent(self, attr_name, text):
+        """撤销重做系统专用的静默设置方法"""
+        widget = getattr(self, attr_name)
+        
+        # 解绑监听，防止撤销本身产生新的记录导致死循环
+        widget.unbind("<<Modified>>")
+        
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        
+        # 强制同步快照
+        if attr_name == "txt_p": self.last_stable_prompt = text
+        else: self.last_stable_script = text
+        
+        # 重置标志位并重新绑定
+        widget.edit_modified(False)
+        widget.bind("<<Modified>>", self._on_text_modified)
+        
+        # 如果该卡片在视野外，滚动使其可见（可选增强体验）
+        widget.see("insert")
     
     def set_motion_by_name(self, name):
         """供 MotionSearcher 调用的回调，实现静默设置"""
@@ -379,18 +505,20 @@ class TaskCard:
 
     def update_motion_list(self):
         """刷新动态下拉列表（含内置和自定义）"""
-        # "无" 表示不添加任何镜头描述
         all_keys = ["无"] + list(core_logic.DEFAULT_MOTIONS.keys()) + list(self.app.custom_motions.keys())
         self.cb_motion['values'] = all_keys
         
-        # 恢复存档数据
+        # 1. 恢复存档数据
         saved_key = self.data.get("motion_key", "无")
+        
+        # 2. 设置当前选中的值
         if saved_key in all_keys:
             self.cb_motion.set(saved_key)
-            self.update_motion_preview(saved_key)
         else:
             self.cb_motion.set("无")
-            self.update_motion_preview("无")
+            
+        # 3. 立即刷新 UI 预览（即便不保存也要让用户看到当前选的是什么）
+        self.update_motion_preview(self.cb_motion.get())
 
     def on_motion_change(self, e):
         """当用户选择不同的动态效果时"""
@@ -462,25 +590,48 @@ class TaskCard:
     # --- 以下为功能方法保持不变 ---
 
     def select_file(self):
-        p = filedialog.askopenfilename()
-        if p: self.file_path = p; self.load_thumbnail(p); self.app.auto_save_all()
-
-    def delete_card(self):
-        if messagebox.askyesno("删除", "确定删除？"):
-            self.app.record_structure_change()
-            self.delete_card_clean()
-            if self in self.app.tasks: self.app.tasks.remove(self)
+        p = filedialog.askopenfilename(
+            filetypes=[("图像文件", "*.png *.jpg *.jpeg *.webp")]
+        )
+        if p: 
+            self.file_path = p
+            self.load_thumbnail(p)
+            # 确保路径变动后立即触发自动保存
             self.app.auto_save_all()
 
+    # TaskCard 类内部
+    def delete_card(self):
+        if self.is_running:
+            messagebox.showwarning("警告", "该任务正在运行中，无法删除！")
+            return
+
+    # 2. 用户确认
+        if messagebox.askyesno("删除", "确定删除此卡片？"):
+        # 3. 调用 App 层的精准销毁（这步会触发 ActionManager 记录动作）
+            self.app.destroy_card_by_id(self.task_id, record=True)
+       
+    def _notify_change(self, event=None):
+        """通用变更通知：任何 UI 变动都指向这里"""
+        # 1. 只有在非撤销/重做期间才触发（可选，防止循环）
+        # 2. 触发全局保存
+        self.app.auto_save_all()
 # TaskCard 内部建议的清理函数
+# --- 修改 TaskCard 内部的 delete_card_clean ---
     def delete_card_clean(self):
-        self.is_running = False  # 强制终止线程循环
+        self.is_running = False 
+        
+        # 1. 从主程序的全局列表中移除
+        if self in self.app.tasks:
+            self.app.tasks.remove(self)
+        
+        # 2. 从主程序的映射字典中移除 (使用我们刚写的清理函数)
+        self.app.remove_task_reference(self.task_id)
+        
+        # 3. 销毁 UI
         try:
             self.frame.destroy()
         except:
             pass
-        if self in self.app.tasks:
-            self.app.tasks.remove(self)
 
     def load_thumbnail(self, p):
         try:
@@ -492,73 +643,139 @@ class TaskCard:
     def update_voice_list(self):
         self.cb['values'] = list(self.app.voice_lib.keys())
 
+    def get_data(self):
+        """提取当前卡片的所有实时状态数据"""
+        return {
+            "task_id": self.task_id,
+            "prompt": self.txt_p.get("1.0", "end-1c").strip(),
+            "script": self.txt_s.get("1.0", "end-1c").strip(),
+            "img_path": self.file_path,
+            "motion_key": self.cb_motion.get(),
+            "char": self.cb.get(),
+            "ratio_text": self.cb_ratio.get(),
+            "duration_text": self.cb_dur.get(),
+            "status": self.lbl_st.cget("text")
+        }
+    
+
     def start(self):
-        self.app.stop_queue_signal = False
         if not self.file_path:
             messagebox.showwarning("提示", "请先选择图片"); return
         if self.is_running: return
-        self.is_running = True; self.btn.config(state="disabled")
+
+        self.is_running = True
+        self.btn.config(state="disabled", text="⏳ 运行中")
+        
+        # 1. 在【主线程】启动计时器
+        self.start_timer_ui()
+        
+        # 2. 在【子线程】启动业务逻辑
         threading.Thread(target=self.work, daemon=True).start()
 
- 
+
+    def start_timer_ui(self):
+        """由主线程驱动的 UI 刷新器"""
+        start_t = time.time()
+        
+        def tick():
+            # 只要任务还在跑，且卡片没被删，就继续计秒
+            if self.is_running and self.app.find_task_by_id(self.task_id):
+                try:
+                    if self.lbl_tm.winfo_exists():
+                        elapsed = int(time.time() - start_t)
+                        m, s = divmod(elapsed, 60)
+                        self.lbl_tm.config(text=f"{m:02d}:{s:02d}")
+                        
+                        # 解决 EXE 恢复后锁定的关键补丁
+                        # 强制主线程处理积压的 UI 任务
+                        self.app.root.update_idletasks()
+                        
+                        self.app.root.after(1000, tick)
+                except:
+                    pass
+        tick()
+    # --- 在 TaskCard 类内部添加 ---
+
+    def safe_update_status(self, text, foreground="black"):
+        """安全更新 UI，如果卡片已被删则停止线程"""
+        def _update():
+            try:
+                # 检查组件是否还存在
+                if self.frame.winfo_exists():
+                    self.lbl_st.config(text=text, foreground=foreground)
+            except:
+                pass
+
+        # 1. 检查 ID 是否还在活跃映射中
+        if self.app.find_task_by_id(self.task_id):
+            self.app.root.after(0, _update)
+        else:
+            # 2. 如果卡片不在了，标志位设为 False，后台线程会在下一个循环停止
+            print(f"DEBUG: 任务 {self.task_id} 已从映射中移除，线程将停止。")
+            self.is_running = False
 
     def work(self):
-        """阶段一：本地调度与激活。负责拿Key并获取taskId"""
-        start_t = time.time()
-        def tick():
-            if self.is_running:
-                m, s = divmod(int(time.time() - start_t), 60)
-                self.lbl_tm.config(text=f"{m:02d}:{s:02d}")
-                self.app.root.after(1000, tick)
-        tick()
-
+        """
+        运行在子线程：负责核心业务逻辑（API请求、排队等）。
+        不再包含 tick 计时器，计时器由主线程独立维护。
+        """
         blacklist = []
         max_activate_retries = 3
         
         # --- 核心排队循环 ---
-        while self.is_running:
-            # 1. 获取资源 (acquire_key 现在内部自带 CV 阻塞排队和停止信号检测)
-            res = self.app.res_manager.acquire_key(blacklist)
-            
-            # 【重要修改】判断 acquire_key 为何返回
-            if res is None: 
-                # 只有当 self.app.stop_queue_signal 为 True 时才会返回 None
-                self.lbl_st.config(text="🛑 已停止排队", foreground="orange")
-                break
-            
-            # 2. 走到这里说明拿到了可用 Key，立刻更新 UI 负载
-            try:
-                self.lbl_st.config(text=f"📡 激活中({res['label']})...", foreground="blue")
-                self.app.update_monitor() # <-- 新增：让主界面负载数字立刻变动
+        try:
+            while self.is_running:
+                # 1. 获取资源
+                res = self.app.res_manager.acquire_key(blacklist)
                 
-                # 3. 尝试提交以获取 taskId
-                submit_res = self._submit_to_server(res['key'])
+                # 判断 acquire_key 为何返回
+                if res is None: 
+                    # 只有当 self.app.stop_queue_signal 为 True 时才会返回 None
+                    self.safe_update_status(text="🛑 已停止排队", foreground="orange")
+                    break
                 
-                if submit_res.get("code") == 0:
-                    task_id = submit_res["data"]["taskId"]
-                    # 【关键点】进入不可打断的执行阶段，此函数执行完必须内部 return 或 release_key
-                    self._run_remote_polling(task_id, res)
-                    break 
-                else:
-                    # 提交失败处理
-                    print(f"❌ 激活失败: {submit_res.get('msg')}")
-                    blacklist.append(res['key'])
-                    self.app.res_manager.release_key(res['key'])
-                    self.app.update_monitor() # <-- 新增：释放后同步负载
+                # 2. 拿到可用 Key，更新 UI 负载
+                try:
+                    self.safe_update_status(text=f"📡 激活中({res['label']})...", foreground="blue")
+                    # 使用 after(0) 确保跨线程调用 UI 更新是安全的
+                    self.app.root.after(0, self.app.update_monitor)
                     
-                    if len(blacklist) >= max_activate_retries:
-                        self.lbl_st.config(text="❌ 多次激活失败", foreground="red")
-                        break
-                    time.sleep(1) # 短暂等待重试
+                    # 3. 尝试提交以获取 taskId
+                    submit_res = self._submit_to_server(res['key'])
+                    
+                    if submit_res.get("code") == 0:
+                        task_id = submit_res["data"]["taskId"]
+                        # 进入远程轮询阶段
+                        # 注意：_run_remote_polling 内部逻辑应在完成后自行 return 或 release_key
+                        self._run_remote_polling(task_id, res)
+                        break # 任务成功开始/结束，跳出排队循环
+                    else:
+                        # 提交失败处理
+                        print(f"❌ 激活失败: {submit_res.get('msg')}")
+                        blacklist.append(res['key'])
+                        self.app.res_manager.release_key(res['key'])
+                        self.app.root.after(0, self.app.update_monitor)
+                        
+                        if len(blacklist) >= max_activate_retries:
+                            self.safe_update_status(text="❌ 多次激活失败", foreground="red")
+                            break
+                        time.sleep(1) # 短暂等待重试
 
-            except Exception as e:
-                print(f"⚠️ 调度异常: {e}")
-                if res: 
-                    self.app.res_manager.release_key(res['key'])
-                    self.app.update_monitor()
-                break
+                except Exception as e:
+                    print(f"⚠️ 调度异常: {e}")
+                    if res: 
+                        self.app.res_manager.release_key(res['key'])
+                        self.app.root.after(0, self.app.update_monitor)
+                    break
+        
+        finally:
+            # 统一出口：无论任务成功、失败还是中止，都必须重置状态
+            self.is_running = False
+            # 恢复按钮状态（必须回到主线程操作）
+            self.app.root.after(0, self._reset_ui_state)
 
-        self.is_running = False
+    def _reset_ui_state(self):
+        """辅助函数：在主线程恢复 UI 初始状态"""
         self.btn.config(state="normal", text="▶ 运行")
 
     def _submit_to_server(self, api_key):
@@ -596,15 +813,15 @@ class TaskCard:
                 if code == 0 and data:
                     video_url = data[0].get("fileUrl")
                     self._handle_download(video_url)
-                    self.lbl_st.config(text="✅ 处理完成", foreground="green")
+                    self.safe_update_status(text="✅ 处理完成", foreground="green")
                     break
                 elif code in [804, 813]:
                     status_text = "运行中" if code == 804 else "云端排队"
-                    self.lbl_st.config(text=f"⏳ {status_text}...", foreground="#0078d4")
+                    self.safe_update_status(text=f"⏳ {status_text}...", foreground="#0078d4")
                 elif code == 805:
                     # [优化] 增强健壮性的 data 检查
                     reason = data.get("failedReason") if isinstance(data, dict) else "节点计算失败"
-                    self.lbl_st.config(text="❌ 生成失败", foreground="red")
+                    self.safe_update_status(text="❌ 生成失败", foreground="red")
                     print(f"❌ 云端任务失败: {reason}")
                     break
                 else:
@@ -622,7 +839,7 @@ class TaskCard:
 
         except Exception as e:
             print(f"❌ 执行期异常: {e}")
-            self.lbl_st.config(text="❌ 任务中断", foreground="red")
+            self.safe_update_status(text="❌ 任务中断", foreground="red")
         finally:
             # 无论如何释放资源
             self.app.res_manager.release_key(api_key)
@@ -631,41 +848,143 @@ class TaskCard:
 
     def _handle_download(self, video_url):
         """封装下载保存逻辑"""
-        self.lbl_st.config(text="📥 正在下载...", foreground="purple")
+        self.safe_update_status(text="📥 正在下载...", foreground="purple")
         target_dir = self.app.save_dir.get()
         if not os.path.exists(target_dir): os.makedirs(target_dir)
         filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
         
         if core_logic.VideoDownloader.download(video_url, target_dir, filename):
-            self.lbl_st.config(text="✅ 完成并保存", foreground="green")
+            self.safe_update_status(text="✅ 完成并保存", foreground="green")
         else:
-            self.lbl_st.config(text="❌ 保存失败", foreground="red")
+            self.safe_update_status(text="❌ 保存失败", foreground="red")
+
+class ActionManager:
+    def __init__(self, app):
+        self.app = app
+        self.undo_stack = []
+        self.redo_stack = []
+        self.max_depth = 30
+
+    def push_action(self, action_type, payload):
+        """记录一个新动作"""
+        action = {"type": action_type, "payload": payload}
+        self.undo_stack.append(action)
+        if len(self.undo_stack) > self.max_depth:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear() # 有新动作，清空重做栈
 
 
+
+    def undo(self, event=None):
+        # 1. 撤销前强制结算：如果用户正在打字，先存入当前内容
+        focus_w = self.app.root.focus_get()
+        if isinstance(focus_w, tk.Text) and hasattr(focus_w, "parent_card"):
+            focus_w.parent_card.force_settle()
+
+        # 2. 标准撤销逻辑
+        if not self.undo_stack: return
+        action = self.undo_stack.pop()
+        self.redo_stack.append(action)
+        self._dispatch(action, mode="UNDO")
+
+    # 关键修改：添加 event=None
+    def redo(self, event=None):
+    # 1. 重做前同样强制结算当前正在打字的内容
+        focus_w = self.app.root.focus_get()
+        if isinstance(focus_w, tk.Text) and hasattr(focus_w, "parent_card"):
+            focus_w.parent_card.force_settle()
+
+        # 2. 执行重做逻辑
+        if not self.redo_stack: return
+        action = self.redo_stack.pop()
+        self.undo_stack.append(action)
+        self._dispatch(action, mode="REDO")
+
+    def _dispatch(self, action, mode="UNDO"):
+        """
+        核心分发器：执行具体的 UI 撤销/重做操作。
+        已修复：处理 BATCH_DEL 时列表对象无 .get() 的问题。
+        """
+        a_type = action["type"]
+        p = action["payload"]
+
+        # --- 1. 运行状态安全检查 ---
+        # 针对批量删除的特殊处理
+        if a_type == "BATCH_DEL":
+            if mode == "REDO":
+                # 检查这批卡片里有没有人在运行
+                # p 是列表，所以要遍历检查
+                if any(self.app.task_mapping.get(item["task_id"]).is_running 
+                    for item in p if self.app.task_mapping.get(item["task_id"])):
+                    print("DEBUG: 批量重做删除被拦截 - 包含运行中的卡片")
+                    return
+        else:
+            # 针对单张卡片操作的检查（ADD_CARD, DEL_CARD, EDIT_TEXT）
+            target_id = p.get("task_id") if isinstance(p, dict) else None
+            target_card = self.app.task_mapping.get(target_id)
+
+            if target_card and target_card.is_running:
+                is_undo_add = (a_type == "ADD_CARD" and mode == "UNDO")
+                is_redo_del = (a_type == "DEL_CARD" and mode == "REDO")
+                is_edit = (a_type == "EDIT_TEXT")
+                if is_undo_add or is_redo_del or is_edit:
+                    print(f"DEBUG: 动作 {a_type} 被拦截 - 卡片正在运行")
+                    return
+
+        # --- 2. 具体执行逻辑 ---
+        if a_type == "ADD_CARD":
+            if mode == "UNDO":
+                self.app.destroy_card_by_id(p["task_id"], record=False)
+            else:
+                self.app.add_task_card(p["data"], is_redo_op=True)
+
+        elif a_type == "DEL_CARD":
+            if mode == "UNDO":
+                new_card = self.app.add_task_card(p["data"], is_undo_op=True)
+                new_card.is_running = False
+                if new_card in self.app.tasks:
+                    self.app.tasks.remove(new_card)
+                self.app.tasks.insert(p["index"], new_card)
+                self.app.refresh_ui_layout()
+            else:
+                self.app.destroy_card_by_id(p["task_id"], record=False)
+
+        elif a_type == "BATCH_DEL":
+            if mode == "UNDO":
+                # 撤销删除：复活多张卡片
+                sorted_payload = sorted(p, key=lambda x: x["index"])
+                for item in sorted_payload:
+                    new_card = self.app.add_task_card(item["data"], is_undo_op=True)
+                    if new_card in self.app.tasks:
+                        self.app.tasks.remove(new_card)
+                    self.app.tasks.insert(item["index"], new_card)
+                self.app.refresh_ui_layout()
+            else:
+                # 重做删除：批量物理切除
+                for item in p:
+                    self.app.destroy_card_by_id(item["task_id"], record=False)
+
+        elif a_type == "EDIT_TEXT":
+            card = self.app.task_mapping.get(p["task_id"])
+            if card:
+                target_val = p["old_val"] if mode == "UNDO" else p["new_val"]
+                card.set_text_silent(p["field"], target_val)
+                self.app.auto_save_all()
 # --- 4. 主程序 ---
 class VideoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("1.5")
+        self.root.title("1.9 - iu_thread")
         self.root.geometry("1100x850")
-
-        # --- 1. 数据初始化 ---
+        
+        # --- 1. 数据与资源初始化 ---
         self.all_data = core_logic.DataIO.load_json("config_and_history.json", {})
-        self.global_presets = {
-            "aspect_ratio": "9:16",  # 默认竖屏
-            "quality": "HD",
-            "motion": 5
-        }
         
-        # API 与 系统参数
+        # API 与系统参数
         self.web_appid = tk.StringVar(value="1973465795936260097")
-        #self.web_appid = tk.StringVar(value="2001838441669246977") # 默认固定ID
         self.sys_prompt = tk.StringVar(value=self.all_data.get("sys_prompt", ""))
-        
-        # 核心：自定义镜头库管理
         self.custom_motions = self.all_data.get("custom_motions", {})
         
-        # 路径与资源
         saved_path = self.all_data.get("save_path")
         if not saved_path: 
             saved_path = os.path.join(os.getcwd(), "downloads")
@@ -673,132 +992,86 @@ class VideoApp:
 
         self.api_pool = self.all_data.get("api_pool", [])
         self.voice_lib = self.all_data.get("voices", {})
-        # 传入 self (即当前 VideoApp 实例)，这样 ResourceManager 才能读取到 stop_queue_signal
         self.res_manager = core_logic.ResourceManager(self, self.api_pool)
-        #self.res_manager = core_logic.ResourceManager(self.api_pool)
         self.stop_queue_signal = False
         
-        self.tasks = []
+        # --- 2. 核心数据结构 ---
+        self.tasks = []           # 列表：管理 UI 物理顺序
+        self.task_mapping = {}    # 映射表：{task_id: card_instance} 解决膨胀关键
+        
+        # --- 3. 撤销经理初始化 ---
+        # 废弃直接操作 undo_stack，改用经理类
+        self.action_manager = ActionManager(self)
 
-        # --- 2. 撤销系统初始化 ---
-        self.undo_stack = []  # 结构化撤销栈
-        self.redo_stack = []  # 重做栈
-
-        # --- 3. UI 初始化 ---
+        # --- 4. UI 初始化 ---
         self.setup_menu()
         self.setup_ui()
+        
+        # 只有在加载历史时，不产生撤销记录
         self.load_history()
 
-        # --- 4. 绑定全局快捷键 ---
-        self.root.bind("<Control-z>", self.global_undo)
-        self.root.bind("<Control-Z>", self.global_undo)
-        self.root.bind("<Control-y>", self.global_redo)
-        self.root.bind("<Control-Y>", self.global_redo)
+        # --- 5. 绑定全局快捷键 ---
+        # 绑定到经理类的方法上
+        self.root.bind("<Control-z>", self.action_manager.undo)
+        self.root.bind("<Control-Z>", self.action_manager.undo)
+        self.root.bind("<Control-y>", self.action_manager.redo)
+        self.root.bind("<Control-Y>", self.action_manager.redo)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        self.root.bind("<FocusIn>", lambda e: self.root.update())
+        self.root.bind("<Map>", lambda e: self.root.update_idletasks())
+        # 【修复说明】：删除了 self.undo_stack.append(self._get_current_snapshot())
+        # 因为在 Action-based 逻辑下，初始状态不需要占位，否则撤销第一步会报错。
+        self.root.bind("<Map>", self._force_refresh_on_restore)
+
+    def _force_refresh_on_restore(self, event):
+        """当窗口从任务栏恢复时，强制刷新所有组件"""
+        try:
+            self.root.update_idletasks()
+            for task in self.tasks:
+                if task.is_running:
+                    # 重新计算一次时间，纠正可能的显示偏差
+                    task.refresh_ui_layout() # 或者你自定义的轻量刷新
+        except:
+            pass
     # --- 撤销/重做核心逻辑 ---
 
+    def find_task_by_id(self, task_id):
+        """【新增】通过 ID 快速找回卡片对象"""
+        return self.task_mapping.get(task_id)
+
+    def remove_task_reference(self, task_id):
+        """【新增】物理删除卡片时，清理映射关系，防止内存泄漏"""
+        if task_id in self.task_mapping:
+            del self.task_mapping[task_id]
+        
     def global_undo(self, event=None):
-        """智能撤销：优先处理文字，其次处理卡片结构"""
         focus_w = self.root.focus_get()
+        # 依然保留对 Text 组件自带撤销的支持
         if isinstance(focus_w, tk.Text):
             try:
                 focus_w.edit_undo()
                 return "break"
             except Exception: pass
-        self.app_level_undo()
+        
+        # 调用新经理
+        self.action_manager.undo()
         return "break"
 
     def global_redo(self, event=None):
-        """重做逻辑"""
         focus_w = self.root.focus_get()
         if isinstance(focus_w, tk.Text):
             try:
                 focus_w.edit_redo()
                 return "break"
             except Exception: pass
-        self.app_level_redo()
+            
+        self.action_manager.redo()
         return "break"
 
-    def record_structure_change(self):
-        """在发生 增、删、清空 前调用，保存当前所有卡片快照"""
-        snapshot = []
-        for t in self.tasks:
-            try:
-                # 必须确保组件还活着才能读取数据
-                if t.frame.winfo_exists():
-                    snapshot.append({
-                        "img_path": t.file_path,
-                        "prompt": t.txt_p.get("1.0", tk.END).strip(),
-                        "script": t.txt_s.get("1.0", tk.END).strip(),
-                        "char": t.cb.get(),
-                        # 【修正】键名统一为 _text，确保被 TaskCard 正确识别
-                        "ratio_text": t.cb_ratio.get(),
-                        "duration_text": t.cb_dur.get(),
-                        "motion_key": t.cb_motion.get()
-                    })
-            except Exception as e:
-                print(f"⚠️ 快照跳过损坏卡片: {e}")
-                continue
-        
-        self.undo_stack.append(snapshot)
-        # 限制栈深度
-        if len(self.undo_stack) > 30: 
-            self.undo_stack.pop(0)
-        # 结构改变后，重做栈必须清空，否则会导致状态冲突
-        self.redo_stack.clear()
 
-    def app_level_undo(self):
-        if not self.undo_stack: return
-        
-        # 保存当前状态到 redo 栈
-        self.redo_stack.append(self._get_current_snapshot())
-        
-        # 恢复状态
-        last_state = self.undo_stack.pop()
-        self._apply_snapshot(last_state)
-
-    def app_level_redo(self):
-        if not self.redo_stack: return
-        
-        # 保存当前状态到 undo 栈
-        self.undo_stack.append(self._get_current_snapshot())
-        
-        # 恢复状态
-        next_state = self.redo_stack.pop()
-        self._apply_snapshot(next_state)
-
-    def _get_current_snapshot(self):
-        """内部工具：获取当前 UI 状态快照"""
-        snapshot = []
-        for t in self.tasks:
-            snapshot.append({
-                "img_path": t.file_path,
-                "prompt": t.txt_p.get("1.0", tk.END).strip(),
-                "script": t.txt_s.get("1.0", tk.END).strip(),
-                "char": t.cb.get(),
-                "ratio": t.cb_ratio.get(),
-                "duration": t.cb_dur.get(),
-                "motion_key": t.cb_motion.get()
-            })
-        return snapshot
-
-    def _apply_snapshot(self, state_data):
-        """物理重建 UI 卡片"""
-        for t in list(self.tasks):
-            if t.frame.winfo_exists():
-                t.frame.destroy()
-        self.tasks.clear()
-
-        for data in state_data:
-            # 假设 add_task_card 内部会读取 data["motion_key"]
-            self.add_task_card(data, is_undo_op=True)
-        
-        self.update_monitor()
-        self.auto_save_all()
-
-    # --- 镜头管理增强逻辑 ---
+        # --- 镜头管理增强逻辑 ---
 
     def refresh_all_tasks_motion(self):
         """当镜头预设库发生变动时，静默刷新所有卡片的下拉列表内容"""
@@ -874,39 +1147,103 @@ class VideoApp:
         """主界面菜单或按钮调用的函数"""
         MotionPresetEditor(self.root, self)
 
-    def add_task_card(self, data=None, is_undo_op=False):
+    
+    def add_task_card(self, data=None, is_undo_op=False, is_redo_op=False):
         """新建或根据数据恢复卡片"""
+        is_loading = data is not None 
         
-        # 1. 如果 data 为 None，说明是点击“➕ 新建镜头”按钮触发的
-        if data is None and not is_undo_op:
-            # 记录撤销状态（你原有的逻辑）
-            self.record_structure_change()
-            
-            # 【关键修改】：从主界面下拉框抓取当前的预设值
-            # 这样新建出来的卡片就会直接应用你选好的比例和时长
+        if data is None:
+            # 补全默认字段，特别是 motion_key
             data = {
                 "ratio_text": self.preset_ratio.get(),
                 "duration_text": self.preset_dur.get(),
+                "motion_key": "无",  # 显式提供默认值
                 "status": "waiting",
                 "prompt": "",
+                "script": "",
+                "char": "无",
                 "img_path": ""
             }
-
-        # 2. 创建卡片（此时 data 已经有值了，TaskCard 会读取这些预设）
+        
+        # 1. 创建卡片（确保 TaskCard.__init__ 内部调用了 self.update_motion_list()）
         card = TaskCard(self.sf, self, data=data)
         self.tasks.append(card)
         
-        # 3. UI 刷新逻辑
-        self.sf.update_idletasks()
-        self.cv.config(scrollregion=self.cv.bbox("all"))
+        # 2. 映射记录
+        if hasattr(card, 'task_id'):
+            self.task_mapping[card.task_id] = card
+
+        # 3. 撤销记录逻辑 (保持你原有的不变)
+        if not (is_undo_op or is_redo_op or is_loading):
+            self.action_manager.push_action("ADD_CARD", {
+                "task_id": card.task_id,
+                "data": card.get_data() 
+            })
+
+        # 4. UI 刷新
+        self._refresh_canvas_scroll()
         
-        # 4. 只有真正的新建（非加载历史，非撤销）才滚动到底部并保存
-        # 这里用一个小技巧判断：如果 data 里的 prompt 是空的，通常代表是刚点的按钮
-        if not is_undo_op and data.get("prompt") == "":
+        if not is_loading:
             self.cv.yview_moveto(1.0)
             self.auto_save_all()
             
         return card
+
+    
+
+    def destroy_card_by_id(self, task_id, record=True):
+        """精准销毁：record=True时记录到撤销栈；自动跳过运行中的卡片"""
+        card = self.task_mapping.get(task_id)
+        if not card: return
+
+        # --- 【关键修正】运行锁保护 ---
+        if card.is_running:
+            print(f"DEBUG: 拦截销毁请求 - 卡片 {task_id} 正在任务中，跳过销毁。")
+            return 
+
+        # 1. 记录撤销动作
+        if record:
+            try:
+                idx = self.tasks.index(card)
+                self.action_manager.push_action("DEL_CARD", {
+                    "task_id": task_id,
+                    "data": card.get_data(),
+                    "index": idx
+                })
+            except ValueError:
+                pass # 防止卡片已不在 tasks 列表中的异常
+
+        # 2. 清理内存引用
+        if card in self.tasks: 
+            self.tasks.remove(card)
+        if task_id in self.task_mapping: 
+            del self.task_mapping[task_id]
+        
+        # 3. 物理销毁 UI 组件
+        if card.frame.winfo_exists():
+            card.frame.destroy()
+        
+        # 4. 刷新 UI 容器布局
+        # 确保在 destroy 后刷新，Canvas 才能正确计算剩余卡片的高度
+        self.root.after(10, self._refresh_canvas_scroll) # 延迟一小下确保组件已彻底销毁
+        
+        # 5. 系统状态同步
+        self.update_monitor()
+        self.auto_save_all()
+
+    def _refresh_canvas_scroll(self):
+        """提取出的排版刷新逻辑"""
+        self.sf.update_idletasks()
+        self.cv.config(scrollregion=self.cv.bbox("all"))
+
+    def refresh_ui_layout(self):
+        """重新排版所有卡片（撤销删除插回原位后必须调用）"""
+        for card in self.tasks:
+            card.frame.pack_forget()
+            card.frame.pack(fill=tk.X, padx=15, pady=8)
+        self.cv.config(scrollregion=self.cv.bbox("all"))
+
+
     
 
     def clear_all_tasks(self):
@@ -914,52 +1251,39 @@ class VideoApp:
         if not self.tasks: return
 
         msg = ("请选择要删除的范围：\n\n"
-               "【是】：删除所有已停止的任务\n"
-               "【否】：仅删除未请求（就绪）的任务\n"
-               "【取消】：放弃\n\n"
-               "提示：撤销快捷键 Ctrl+Z 可找回删除。")
+            "【是】：删除所有已停止的任务\n"
+            "【否】：仅删除未请求（就绪）的任务\n"
+            "【取消】：放弃\n\n"
+            "提示：一次 Ctrl+Z 即可全部找回。")
         
         choice = messagebox.askyesnocancel("批量删除", msg)
         if choice is None: return
 
-        # 1. 记录撤销点
-        self.record_structure_change()
-
-        # 2. 预筛选：先判断，不销毁
+        # 1. 筛选待删列表
         to_delete = []
         for task in self.tasks:
-            try:
-                # 运行中的任务绝对不删
-                if task.is_running:
-                    continue
-                
-                # 获取状态文本
-                status_text = task.lbl_st.cget("text")
-                
-                # 根据用户选择逻辑进行筛选
-                if choice is True:
-                    # “是”：只要没在运行，全部加入待删列表
-                    to_delete.append(task)
-                elif choice is False:
-                    # “否”：只有状态为“就绪”的才加入待删列表
-                    if status_text == "就绪":
-                        to_delete.append(task)
-            except Exception:
-                # 如果任务已经处于半毁坏状态，保险起见跳过
-                continue
+            if task.is_running: continue
+            status_text = task.lbl_st.cget("text")
+            if choice is True or (choice is False and status_text == "就绪"):
+                to_delete.append(task)
 
-        # 3. 统一销毁：此时不再读取任何 UI 属性
+        if not to_delete: return
+
+        # 2. 构造批量数据包
+        batch_data = []
         for task in to_delete:
-            # 这里的 delete_card_clean 应该包含：
-            # 1. task.frame.destroy() 
-            # 2. 从 self.tasks 列表中移除自己
-            task.delete_card_clean()
+            batch_data.append({
+                "index": self.tasks.index(task),
+                "data": task.get_data(),
+                "task_id": task.task_id
+            })
 
-        # 4. 刷新界面
-        self.sf.update_idletasks()
-        self.cv.config(scrollregion=self.cv.bbox("all"))
-        self.update_monitor()
-        self.auto_save_all()
+        # 3. 记录到撤销经理 (记录一次 BATCH_DEL)
+        self.action_manager.push_action("BATCH_DEL", batch_data)
+
+        # 4. 执行物理删除 (此时 record=False，因为我们已经手动打包记录了)
+        for task in to_delete:
+            self.destroy_card_by_id(task.task_id, record=False)
 
     def on_closing(self):
         self.auto_save_all()
@@ -969,15 +1293,9 @@ class VideoApp:
         try:
             history = []
             for t in self.tasks:
+                # 只有存在的卡片才存，通过 get_data() 获取最准，或者手动提取
                 if t.frame.winfo_exists():
-                    history.append({
-                        "img_path": t.file_path,
-                        "prompt": t.txt_p.get("1.0", tk.END).strip(),
-                        "script": t.txt_s.get("1.0", tk.END).strip(),
-                        "char": t.cb.get(),
-                        "ratio": t.cb_ratio.get(),
-                        "duration": t.cb_dur.get()
-                    })
+                    history.append(t.get_data()) # 推荐在 TaskCard 里实现 get_data
             full_config = {
             "web_appid": self.web_appid.get(),
             "sys_prompt": self.sys_prompt.get(),
@@ -996,12 +1314,20 @@ class VideoApp:
             task.update_motion_list()
 
     def load_history(self):
-        for h in self.all_data.get("task_history", []): 
-            self.add_task_card(h, is_undo_op=True) # 载入历史不需要进 undo 栈
-        if not self.tasks: self.add_task_card()
-        history = self.all_data.get("history", [])
-        for data in history:
-            self.add_task_card(data)
+        # 1. 尝试从全量 history 字段读取（这是你 auto_save_all 存的地方）
+        history_data = self.all_data.get("history", [])
+        
+        # 如果 history 为空，再尝试看旧版的 task_history
+        if not history_data:
+            history_data = self.all_data.get("task_history", [])
+
+        if history_data:
+            for data in history_data:
+                # is_undo_op=True 可以防止加载历史时弹出“新建”提示
+                self.add_task_card(data, is_undo_op=True) 
+        else:
+            # 只有真正没有任何数据时，才创建一个空白卡片
+            self.add_task_card()
 
     #def stop(self): self.stop_queue_signal = True
     def stop(self):
