@@ -8,6 +8,7 @@ import re
 import uuid
 from datetime import datetime
 import core_logic
+from DirectorEditor import DirectorEditor
 
 import runninghub
 
@@ -246,11 +247,19 @@ class VoiceTableEditor:
 # --- 3. 任务卡片 ---
 class TaskCard:
     def __init__(self, parent, app, data=None):
+
         self.app = app
         self.data = data if isinstance(data, dict) else {}
         self.task_id = self.data.get("task_id", str(uuid.uuid4()))
 
-        # --- 【新增】方案 B 状态变量 ---
+        # --- 【新增】DirectorEditor 分镜数据存储 ---
+        
+        # 恢复存档中的分镜数据，如果没有则设为空列表
+        self.saved_shot_data = self.data.get("shot_notes_data", []) 
+        # 恢复是否为自定义运镜的状态
+        self.is_custom_camera = self.data.get("is_custom_camera", False)
+
+        # --- 【原有】方案 B 状态变量 ---
         self.pending_timer = None
         # 记录上一次稳定在栈里的内容快照
         self.last_stable_prompt = self.data.get("prompt", "")
@@ -262,8 +271,14 @@ class TaskCard:
         self.frame.pack(fill=tk.X, padx=15, pady=8)
         self.file_path = self.data.get("img_path", "")
         self.is_running = False
+        
         self.setup_ui()
-        if self.file_path: self.load_thumbnail(self.file_path)
+        
+        if self.file_path: 
+            self.load_thumbnail(self.file_path)
+        
+        # 如果已有分镜数据，初始化时更新一下按钮样式
+        self._update_editor_btn_style()
 
     def setup_ui(self):
         # --- 1. 映射关系定义 ---
@@ -350,60 +365,52 @@ class TaskCard:
         #self.cb.pack(side=tk.LEFT, padx=2)
         #if self.data.get("char"): self.cb.set(self.data["char"])
         #self.cb.bind("<<ComboboxSelected>>", lambda e: self.app.auto_save_all())
-        # --- 1. 动态指令选择 ---
+        # 1. 动态指令选择
         ttk.Label(ctrl, text="动态:").pack(side=tk.LEFT)
         self.cb_motion = ttk.Combobox(ctrl, state="readonly", width=10)
         self.cb_motion.pack(side=tk.LEFT, padx=2)
-        
-        # 【关键】初始化列表并设置初始值
         self.update_motion_list() 
-        # (update_motion_list 内部已经做了 self.cb_motion.set)
 
-        # --- 2. 角色选择 ---
+        # 【新增】导演脚本编辑按钮
+        self.btn_director = ttk.Button(
+            ctrl, 
+            text="🎬 导演", 
+            width=5, 
+            command=self.open_director_editor
+        )
+        self.btn_director.pack(side=tk.LEFT, padx=2)
+
+        # 2. 角色选择
         ttk.Label(ctrl, text="角色:").pack(side=tk.LEFT)
         self.cb = ttk.Combobox(ctrl, state="readonly", width=8)
         self.update_voice_list()
         self.cb.pack(side=tk.LEFT, padx=2)
-        
-        # 【关键】恢复角色初始值
         saved_char = self.data.get("char")
         if saved_char: self.cb.set(saved_char)
 
-
-# --- 3. 比例选择 (修改后的逻辑) ---
+        # 3. 比例选择
         ttk.Label(ctrl, text="比例:").pack(side=tk.LEFT)
         self.cb_ratio = ttk.Combobox(ctrl, values=list(self.ratio_map.keys()), width=12, state="readonly")
-        
-        # [逻辑优化]：
-        # 1. 优先尝试获取 ratio_text (对应我们刚加的全局预设)
-        # 2. 其次尝试获取旧版数据 ratio (对应历史记录)
-        # 3. 最后给个兜底值
         ratio_text_preset = self.data.get("ratio_text")
         if ratio_text_preset:
             self.cb_ratio.set(ratio_text_preset)
         else:
-            saved_ratio_key = self.data.get("ratio", "landscape") # 旧的 key
+            saved_ratio_key = self.data.get("ratio", "landscape")
             self.cb_ratio.set(self.ratio_rev_map.get(saved_ratio_key, "横屏 (16:9)"))
-            
         self.cb_ratio.pack(side=tk.LEFT, padx=2)
-        self.cb_ratio.bind("<<ComboboxSelected>>", lambda e: self.app.auto_save_all())
 
-
-   # --- 4. 时长选择 (同样的逻辑) ---
+        # 4. 时长选择
         ttk.Label(ctrl, text="时长:").pack(side=tk.LEFT)
         self.cb_dur = ttk.Combobox(ctrl, values=list(self.dur_map.keys()), width=6, state="readonly")
-        
         dur_text_preset = self.data.get("duration_text")
         if dur_text_preset:
             self.cb_dur.set(dur_text_preset)
         else:
             saved_dur_key = self.data.get("duration", "10s")
             self.cb_dur.set(self.dur_rev_map.get(saved_dur_key, "10秒"))
-            
         self.cb_dur.pack(side=tk.LEFT, padx=2)
-        self.cb_dur.bind("<<ComboboxSelected>>", lambda e: self.app.auto_save_all())
         
-        #事件绑定
+        # 事件绑定
         self.cb.bind("<<ComboboxSelected>>", self._on_ui_change)
         self.cb_motion.bind("<<ComboboxSelected>>", self._on_ui_change)
         self.cb_ratio.bind("<<ComboboxSelected>>", self._on_ui_change)
@@ -419,6 +426,67 @@ class TaskCard:
         
         self.lbl_tm = ttk.Label(ctrl, text="00:00")
         self.lbl_tm.pack(side=tk.RIGHT)
+
+
+    def open_director_editor(self):
+        """打开分镜编辑器"""
+        from DirectorEditor import DirectorEditor # 确保已导入
+        
+        # 获取当前任务时长（数字）
+        dur_text = self.cb_dur.get()
+        max_dur = 15 if "15" in dur_text else 10
+        
+        # 获取当前全局相机的短描述
+        motion_name = self.cb_motion.get()
+        # 这里需要你有一个能从名字查到 short_prompt 的方法，或者直接传名字
+        global_cam_short = motion_name 
+        
+        # 检查台词框内容
+        has_dialogue = len(self.txt_s.get("1.0", "end-1c").strip()) > 0
+        
+        # 打开窗口
+        DirectorEditor(
+            master=self.app.root, 
+            max_duration=max_dur,
+            global_camera=global_cam_short,
+            has_dialogue=has_dialogue,
+            # 【关键】如果这里不传，编辑器每次打开都是空白的
+            initial_data=self.saved_shot_data, 
+            callback=self.on_director_save
+        )
+
+    def on_director_save(self, new_data, new_custom):
+        """当编辑器点击确认时"""
+        # 1. 检查数据是否有实质变化，避免无效撤销步骤
+        if new_data == self.saved_shot_data and new_custom == self.is_custom_camera:
+            return
+
+        # 2. 记录动作到全局 Undo 栈
+        self.app.action_manager.push_action("EDIT_SHOTS", {
+            "task_id": self.task_id,
+            "old_data": self.saved_shot_data,  # 之前的快照
+            "new_data": new_data,             # 现在的快照
+            "old_custom": self.is_custom_camera,
+            "new_custom": new_custom
+        })
+
+        # 3. 更新当前内存数据
+        self.saved_shot_data = new_data
+        self.is_custom_camera = new_custom
+        
+        # 4. 更新 UI 和保存
+        self._update_editor_btn_style()
+        if hasattr(self.app, 'auto_save_all'):
+            self.app.auto_save_all()
+
+    def _update_editor_btn_style(self):
+        """根据是否有数据更新按钮外观"""
+        if self.saved_shot_data:
+            # 如果有数据，按钮文字加粗或变色
+            self.btn_director.configure(text="🎬 [编]") 
+        else:
+            self.btn_director.configure(text="🎬 导演")
+
 
     def _on_ui_change(self, event=None):
         """当 Combobox 等组件改变时触发的统一保存逻辑"""
@@ -503,22 +571,58 @@ class TaskCard:
         self.app.auto_save_all()
 
 
+    def get_short_camera_name(self, name):
+        """根据中文名获取对应的英文短提示词 (用于 DirectorEditor Table)"""
+        if name == "无": return ""
+        
+        # 1. 检索内置库
+        import core_logic
+        for item in core_logic.MOTION_LIBRARY:
+            if item["name"] == name:
+                return item.get("short_prompt", "")
+        
+        # 2. 检索自定义库
+        custom_motions = getattr(self.app, 'custom_motions', {})
+        custom_data = custom_motions.get(name, "")
+        return custom_data.get("short_prompt", name) if isinstance(custom_data, dict) else custom_data
+
+    def get_full_camera_prompt(self, name):
+        """根据中文名获取对应的详细提示词 (用于全局 Final Prompt)"""
+        if name == "无": return ""
+            
+        import core_logic
+        for item in core_logic.MOTION_LIBRARY:
+            if item["name"] == name:
+                return item.get("prompt", "")
+        
+        # 检索自定义库
+        custom_motions = getattr(self.app, 'custom_motions', {})
+        custom_data = custom_motions.get(name, "")
+        return custom_data.get("prompt", custom_data) if isinstance(custom_data, dict) else custom_data
+    
+
     def update_motion_list(self):
-        """刷新动态下拉列表（含内置和自定义）"""
-        all_keys = ["无"] + list(core_logic.DEFAULT_MOTIONS.keys()) + list(self.app.custom_motions.keys())
+        """刷新动态下拉列表（从 MOTION_LIBRARY 列表结构加载）"""
+        # 1. 从 core_logic 里的列表提取名称
+        # 假设 MOTION_LIBRARY = [{"name": "特写镜头", ...}, ...]
+        #import core_logic
+        builtin_names = [item["name"] for item in core_logic.MOTION_LIBRARY]
+        
+        # 2. 提取自定义运动的名称 (兼容性处理)
+        custom_motions = getattr(self.app, 'custom_motions', {})
+        custom_names = list(custom_motions.keys())
+        
+        # 3. 合并列表并更新 UI
+        all_keys = ["无"] + builtin_names + custom_names
         self.cb_motion['values'] = all_keys
         
-        # 1. 恢复存档数据
+        # 4. 恢复存档数据
         saved_key = self.data.get("motion_key", "无")
-        
-        # 2. 设置当前选中的值
-        if saved_key in all_keys:
-            self.cb_motion.set(saved_key)
-        else:
-            self.cb_motion.set("无")
+        self.cb_motion.set(saved_key if saved_key in all_keys else "无")
             
-        # 3. 立即刷新 UI 预览（即便不保存也要让用户看到当前选的是什么）
-        self.update_motion_preview(self.cb_motion.get())
+        # 5. 刷新预览
+        if hasattr(self, 'update_motion_preview'):
+            self.update_motion_preview(self.cb_motion.get())
 
     def on_motion_change(self, e):
         """当用户选择不同的动态效果时"""
@@ -536,57 +640,83 @@ class TaskCard:
 
     def get_final_prompt(self):
         """
-        结构化集成：将 角色描述 + 用户提示词 + 动态指令 + 台词内容 融为一体
+        核心逻辑：组合全局描述、分镜脚本、角色声纹、相机指令以及台词。
+        已集成：AttributeError 异常防御、声纹描述注入、自定义运镜优先级判定。
         """
-        # 1. 获取界面上的各项原始值
-        user_p = self.txt_p.get("1.0", tk.END).strip()      # 用户输入的描述
-        script_text = self.txt_s.get("1.0", tk.END).strip() # 台词框内容
-        char_name = self.cb.get()                            # 下拉框选中的角色名
-        motion_key = self.cb_motion.get()                   # 下拉框选中的镜头名
-
-        # 2. 从声纹库提取该角色的“人设描述”
-        char_desc = ""
-        if char_name and char_name in self.app.voice_lib:
-            char_data = self.app.voice_lib[char_name]
-            # 兼容处理：支持你之前存的字典格式 {"desc": "...", "v_id": "..."}
-            if isinstance(char_data, dict):
-                char_desc = char_data.get("desc", "")
-            else:
-                char_desc = str(char_data) # 如果是旧的字符串格式也支持
-
-        # 3. 提取镜头动态描述
-        full_motion_lib = {**core_logic.DEFAULT_MOTIONS, **self.app.custom_motions}
-        motion_p = full_motion_lib.get(motion_key, "") if motion_key != "无" else ""
-
-        # 4. 组合最终 Prompt
-        # 建议结构：[人设背景] + [用户场景描述] + [镜头轨迹] + [语音同步引导]
-        final_components = []
+        # 1. 基础信息获取
+        user_p = self.txt_p.get("1.0", "end-1c").strip()
+        script_text = self.txt_s.get("1.0", "end-1c").strip()
         
-
+        # 2. 角色声纹 Prompt 提取 (含安全性校验，防止旧数据导致报错)
+        char_name = self.cb.get()
+        char_info = self.app.voice_lib.get(char_name, {})
+        
+        char_prompt = ""
+        if isinstance(char_info, dict):
+            # 适配 VoiceTableEditor 存储的新字典格式
+            char_prompt = char_info.get("desc", "").strip()
+        elif isinstance(char_info, str):
+            # 兼容旧版本的纯字符串格式
+            char_prompt = char_info.strip()
             
-        if user_p:
-            final_components.append(user_p)
-        
+        # 生成角色标识符，例如: (小明: 穿着校服的少年)
+        char_tag = f"({char_name}: {char_prompt})" if char_prompt else f"({char_name})"
 
+        # 3. 编译分镜脚本 (来自 DirectorEditor Table)
+        shot_notes_str = ""
+        has_synced_speech = False
+        
+        # 检查是否有保存过分镜数据
+        saved_data = getattr(self, 'saved_shot_data', [])
+        if saved_data:
+            segments = []
+            for item in saved_data:
+                # 基础行：时间 + 动作
+                line = f"{item['start']}–{item['end']}s: [{item['action']}]"
+                
+                # 如果开启了自定义运镜模式，在行内集成 Table 选中的 short_prompt
+                if getattr(self, 'is_custom_camera', False):
+                    line += f" with {item['camera']} movement"
+                
+                # 集成视觉细节描述
+                if item.get('visual'):
+                    line += f", {item['visual']}"
+                
+                # 集成角色台词同步 (注入角色声纹描述)
+                if item.get('sync_speech') and script_text:
+                    line += f" | Character {char_tag} speaking: \"{script_text}\""
+                    has_synced_speech = True
+                
+                segments.append(line)
+            shot_notes_str = ";\n".join(segments)
+
+        # 4. 组合最终 Prompt 列表
+        final_parts = []
+        
+        # A. 全局场景描述
+        if user_p: 
+            final_parts.append(f"[Global Scene]: {user_p}")
+        
+        # B. 详细导演分镜脚本
+        if shot_notes_str: 
+            final_parts.append(f"[Director's Shot Notes]:\n{shot_notes_str}")
+        
+        # C. 全局相机逻辑 (仅当没有在 Table 里自定义相机时生效)
+        if not getattr(self, 'is_custom_camera', False):
+            motion_name = self.cb_motion.get()
+            # 通过你之前定义的 get_full_camera_prompt 获取详细描述
+            motion_p = self.get_full_camera_prompt(motion_name)
+            if motion_p:
+                final_parts.append(f"[Global Camera]: {motion_p}")
             
-        if motion_p:
-            final_components.append(motion_p)
-            
-        if script_text:
-            # 这一步最关键：把台词内容塞进 Prompt，告诉 AI 角色正在说什么
-            final_components.append(f"speaking the lines: '{script_text}', with natural lip-sync")
-        
-        if char_desc:
-            final_components.append(f"Character({char_desc})")
+        # D. 台词内容兜底 (如果在 Table 里没勾选 Sync，则放在最后作为全局台词)
+        if script_text and not has_synced_speech:
+            final_parts.append(f"[Dialogue Content] {char_tag}: \"{script_text}\"")
 
-        # 5. 用逗号合并
-        final_p = ", ".join(final_components)
+        # 5. 使用双换行连接各板块，增强 AI 阅读清晰度
+        full_prompt = "\n\n".join(final_parts)
         
-        # 打印调试信息，你可以在控制台看到最后发给 API 的到底是什么
-        print(f"--- 最终集成 Prompt ---\n{final_p}\n-----------------------")
-        
-        return final_p
-
+        return full_prompt
     # --- 以下为功能方法保持不变 ---
 
     def select_file(self):
@@ -644,18 +774,21 @@ class TaskCard:
         self.cb['values'] = list(self.app.voice_lib.keys())
 
     def get_data(self):
-        """提取当前卡片的所有实时状态数据"""
+        """将卡片所有信息序列化，用于 JSON 存档"""
         return {
             "task_id": self.task_id,
-            "prompt": self.txt_p.get("1.0", "end-1c").strip(),
-            "script": self.txt_s.get("1.0", "end-1c").strip(),
+            "prompt": self.txt_p.get("1.0", "end-1c"),
+            "script": self.txt_s.get("1.0", "end-1c"),
             "img_path": self.file_path,
-            "motion_key": self.cb_motion.get(),
             "char": self.cb.get(),
-            "ratio_text": self.cb_ratio.get(),
-            "duration_text": self.cb_dur.get(),
-            "status": self.lbl_st.cget("text")
+            "motion_key": self.cb_motion.get(),
+            "duration": self.cb_dur.get(),
+            "ratio": self.cb_ratio.get(),
+            # --- 必须包含以下两项，否则 auto_save_all 会丢失分镜数据 ---
+            "shot_notes_data": self.saved_shot_data, 
+            "is_custom_camera": self.is_custom_camera
         }
+        #return data
     
 
     def start(self):
@@ -721,7 +854,8 @@ class TaskCard:
         """
         blacklist = []
         max_activate_retries = 3
-        
+        final_prompt_text = self.get_final_prompt()
+        print(final_prompt_text)
         # --- 核心排队循环 ---
         try:
             while self.is_running:
@@ -970,11 +1104,27 @@ class ActionManager:
                 target_val = p["old_val"] if mode == "UNDO" else p["new_val"]
                 card.set_text_silent(p["field"], target_val)
                 self.app.auto_save_all()
+        
+        elif a_type == "EDIT_SHOTS":
+            card = self.app.task_mapping.get(p["task_id"])
+            if card:
+                # 根据 UNDO 或 REDO 选择对应的快照数据
+                target_data = p["old_data"] if mode == "UNDO" else p["new_data"]
+                target_custom = p["old_custom"] if mode == "UNDO" else p["new_custom"]
+                
+                # 静默更新卡片数据（不触发重复记录）
+                card.saved_shot_data = target_data
+                card.is_custom_camera = target_custom
+                
+                # 更新 UI 按钮状态
+                card._update_editor_btn_style()
+                # 触发保存
+                self.app.auto_save_all()
 # --- 4. 主程序 ---
 class VideoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("1.9 - iu_thread")
+        self.root.title("2.0 -DirectorEditor table")
         self.root.geometry("1100x850")
         
         # --- 1. 数据与资源初始化 ---
